@@ -24,11 +24,15 @@ type Config struct {
 	BlockDuration  time.Duration
 	WhitelistedIPs []string
 	MonitoredPorts []int
-	HoneypotPorts  []int        // Honeypot portları
-	LogFile        string       // Log dosyası
-	MLThreshold    float64      // ML anomali eşiği
-	DPIPatterns    []DPIPattern // DPI desenleri
-	AlertWebhook   string       // Alert webhook URL'i
+	HoneypotPorts  []int
+	LogFile        string
+	MLThreshold    float64
+	DPIPatterns    []DPIPattern
+	AlertWebhook   string
+	LearningMode   bool // Öğrenme modu
+	RateLimits     RateLimitConfig
+	TrustedSubnets []string // Güvenilir subnet'ler
+	ServicePorts   []int    // Legitimate servis portları
 }
 
 // DPI desenleri için yapı
@@ -57,20 +61,25 @@ type FeatureVector struct {
 	TTLVariance     float64
 }
 
-// Connection takibi için gelişmiş yapı güncellendi
+// Connection takibi için gelişmiş yapı
 type ConnectionTracker struct {
-	connections    map[string][]time.Time
-	portAttempts   map[string]map[uint16]bool
-	lastConnection map[string]time.Time
-	fingerprints   map[string][]PacketFingerprint
-	serviceProbes  map[string]map[uint16]int
-	udpAttempts    map[string]map[uint16]bool
-	dpiScores      map[string]float64        // DPI skorları
-	mlFeatures     map[string]*FeatureVector // ML özellikleri
-	honeypots      map[int]*Honeypot         // Honeypot'lar
-	blockedIPs     map[string]time.Time      // Bloklu IP'ler
-	alertCount     map[string]int            // Alert sayıları
-	mutex          sync.RWMutex
+	connections     map[string][]time.Time
+	portAttempts    map[string]map[uint16]bool
+	lastConnection  map[string]time.Time
+	fingerprints    map[string][]PacketFingerprint
+	serviceProbes   map[string]map[uint16]int
+	udpAttempts     map[string]map[uint16]bool
+	dpiScores       map[string]float64        // DPI skorları
+	mlFeatures      map[string]*FeatureVector // ML özellikleri
+	honeypots       map[int]*Honeypot         // Honeypot'lar
+	blockedIPs      map[string]time.Time      // Bloklu IP'ler
+	alertCount      map[string]int            // Alert sayıları
+	mutex           sync.RWMutex
+	trafficPatterns map[string][]TrafficPattern // IP bazlı trafik pattern'leri
+	rateLimiters    map[string]*RateLimiter     // IP ve port bazlı rate limit
+	learningData    map[string]*LearningData    // Öğrenme verisi
+	trustedHosts    map[string]TrustScore       // Güvenilir host'lar
+	config          Config
 }
 
 // Paket parmak izi yapısı
@@ -83,20 +92,70 @@ type PacketFingerprint struct {
 	TTL       uint8
 }
 
+// Rate limit yapılandırması
+type RateLimitConfig struct {
+	HTTPRate    int           // HTTP istekleri için rate limit
+	SSHRate     int           // SSH bağlantıları için rate limit
+	DBRate      int           // Veritabanı bağlantıları için rate limit
+	DefaultRate int           // Diğer portlar için varsayılan rate
+	BurstFactor float64       // Burst toleransı
+	WindowSize  time.Duration // Rate limit penceresi
+}
+
+// Legitimate trafik pattern'leri
+type TrafficPattern struct {
+	Port              int
+	Protocol          string
+	AverageRate       float64
+	PeakRate          float64
+	StandardDeviation float64
+	TimeOfDay         map[int]float64 // Saat bazında normal trafik oranları
+}
+
+// Rate limiter yapısı
+type RateLimiter struct {
+	limit      int
+	burst      int
+	tokens     float64
+	lastUpdate time.Time
+	mutex      sync.Mutex
+}
+
+// Öğrenme verisi yapısı
+type LearningData struct {
+	Connections   []time.Time
+	PortAccesses  map[int][]time.Time
+	ResponseTimes []float64
+	FailureRates  map[int]float64
+	LastUpdate    time.Time
+}
+
+// Güven skoru yapısı
+type TrustScore struct {
+	Score        float64
+	LastActivity time.Time
+	FailCount    int
+	SuccessCount int
+}
+
 // Yeni ConnectionTracker
 func NewConnectionTracker() *ConnectionTracker {
 	ct := &ConnectionTracker{
-		connections:    make(map[string][]time.Time),
-		portAttempts:   make(map[string]map[uint16]bool),
-		lastConnection: make(map[string]time.Time),
-		fingerprints:   make(map[string][]PacketFingerprint),
-		serviceProbes:  make(map[string]map[uint16]int),
-		udpAttempts:    make(map[string]map[uint16]bool),
-		dpiScores:      make(map[string]float64),
-		mlFeatures:     make(map[string]*FeatureVector),
-		honeypots:      make(map[int]*Honeypot),
-		blockedIPs:     make(map[string]time.Time),
-		alertCount:     make(map[string]int),
+		connections:     make(map[string][]time.Time),
+		portAttempts:    make(map[string]map[uint16]bool),
+		lastConnection:  make(map[string]time.Time),
+		fingerprints:    make(map[string][]PacketFingerprint),
+		serviceProbes:   make(map[string]map[uint16]int),
+		udpAttempts:     make(map[string]map[uint16]bool),
+		dpiScores:       make(map[string]float64),
+		mlFeatures:      make(map[string]*FeatureVector),
+		honeypots:       make(map[int]*Honeypot),
+		blockedIPs:      make(map[string]time.Time),
+		alertCount:      make(map[string]int),
+		trafficPatterns: make(map[string][]TrafficPattern),
+		rateLimiters:    make(map[string]*RateLimiter),
+		learningData:    make(map[string]*LearningData),
+		trustedHosts:    make(map[string]TrustScore),
 	}
 
 	// Honeypot'ları başlat
@@ -614,39 +673,266 @@ func (ct *ConnectionTracker) detectThreats(config Config) {
 		ct.mutex.RLock()
 
 		for ip := range ct.fingerprints {
-			if contains(config.WhitelistedIPs, ip) {
+			if ct.isTrustedIP(ip) {
 				continue
 			}
 
-			// DPI skoru kontrolü
-			if ct.dpiScores[ip] > 10.0 {
-				log.Printf("Yüksek DPI skoru tespit edildi! IP: %s, Score: %.2f", ip, ct.dpiScores[ip])
-				blockIP(ip)
-				continue
-			}
+			score := ct.calculateThreatScore(ip)
 
-			// ML anomali skoru kontrolü
-			anomalyScore := ct.calculateAnomalyScore(ip)
-			if anomalyScore > config.MLThreshold {
-				log.Printf("Anormal davranış tespit edildi! IP: %s, Anomaly Score: %.2f", ip, anomalyScore)
-				blockIP(ip)
-				continue
-			}
-
-			// Honeypot kontrolleri
-			for _, hp := range ct.honeypots {
-				hp.mutex.RLock()
-				if hits, exists := hp.Hits[ip]; exists && hits > 2 {
-					log.Printf("Çoklu honeypot erişimi tespit edildi! IP: %s", ip)
-					blockIP(ip)
+			if score > config.MLThreshold {
+				// Yanlış pozitif kontrolü
+				if !ct.isLikelyFalsePositive(ip) {
+					log.Printf("Tehdit tespit edildi! IP: %s, Score: %.2f", ip, score)
+					ct.handleThreat(ip, score)
 				}
-				hp.mutex.RUnlock()
 			}
 		}
 
 		ct.mutex.RUnlock()
 		time.Sleep(1 * time.Second)
 	}
+}
+
+// Tehdit skoru hesaplama
+func (ct *ConnectionTracker) calculateThreatScore(ip string) float64 {
+	var score float64
+
+	// DPI skoru
+	score += ct.dpiScores[ip] * 0.3
+
+	// Anomali skoru
+	score += ct.calculateAnomalyScore(ip) * 0.3
+
+	// Pattern uyumsuzluk skoru
+	score += ct.calculatePatternMismatchScore(ip) * 0.2
+
+	// Honeypot hit skoru
+	score += ct.calculateHoneypotScore(ip) * 0.2
+
+	return score
+}
+
+// Yanlış pozitif kontrolü
+func (ct *ConnectionTracker) isLikelyFalsePositive(ip string) bool {
+	// Legitimate servis kontrolü
+	if ct.isLegitimateService(ip) {
+		return true
+	}
+
+	// Geçmiş davranış analizi
+	if ct.hasGoodHistory(ip) {
+		return true
+	}
+
+	// Subnet kontrolü
+	if ct.isInTrustedSubnet(ip) {
+		return true
+	}
+
+	return false
+}
+
+// IP'nin güvenilir olup olmadığını kontrol et
+func (ct *ConnectionTracker) isTrustedIP(ip string) bool {
+	// Whitelist kontrolü
+	if contains(ct.config.WhitelistedIPs, ip) {
+		return true
+	}
+
+	// Güvenilir host kontrolü
+	if score, exists := ct.trustedHosts[ip]; exists && score.Score > 0.8 {
+		return true
+	}
+
+	return false
+}
+
+// Tehdidi işle
+func (ct *ConnectionTracker) handleThreat(ip string, score float64) {
+	ct.mutex.Lock()
+	defer ct.mutex.Unlock()
+
+	// IP'yi blokla
+	if err := blockIP(ip); err != nil {
+		log.Printf("IP engelleme hatası %s: %v", ip, err)
+		return
+	}
+
+	// Aktiviteyi logla
+	ct.logActivity(ip, "threat_detected", map[string]interface{}{
+		"score": score,
+		"time":  time.Now(),
+	})
+
+	// Alert gönder
+	ct.sendAlert(fmt.Sprintf("Tehdit engellendi - IP: %s, Score: %.2f", ip, score))
+}
+
+// Pattern uyumsuzluk skoru hesapla
+func (ct *ConnectionTracker) calculatePatternMismatchScore(ip string) float64 {
+	patterns, exists := ct.trafficPatterns[ip]
+	if !exists {
+		return 0
+	}
+
+	var totalMismatch float64
+	for _, pattern := range patterns {
+		currentRate := ct.calculateCurrentRate(ip, pattern.Port)
+		expectedRate := pattern.TimeOfDay[time.Now().Hour()]
+
+		// Sapma hesapla
+		mismatch := math.Abs(currentRate-expectedRate) / pattern.StandardDeviation
+		totalMismatch += mismatch
+	}
+
+	return math.Min(totalMismatch/float64(len(patterns)), 1.0)
+}
+
+// Honeypot hit skoru hesapla
+func (ct *ConnectionTracker) calculateHoneypotScore(ip string) float64 {
+	var totalHits int
+	for _, hp := range ct.honeypots {
+		hp.mutex.RLock()
+		hits := hp.Hits[ip]
+		hp.mutex.RUnlock()
+		totalHits += hits
+	}
+
+	// 3 veya daha fazla hit varsa maksimum skor
+	if totalHits >= 3 {
+		return 1.0
+	}
+
+	return float64(totalHits) / 3.0
+}
+
+// IP'nin legitimate servis olup olmadığını kontrol et
+func (ct *ConnectionTracker) isLegitimateService(ip string) bool {
+	// Servis portlarına yapılan bağlantıları kontrol et
+	if attempts, exists := ct.portAttempts[ip]; exists {
+		legitimatePortCount := 0
+		for port := range attempts {
+			if containsPort(ct.config.ServicePorts, int(port)) {
+				legitimatePortCount++
+			}
+		}
+
+		// Sadece legitimate portlara erişim varsa
+		return legitimatePortCount == len(attempts)
+	}
+	return false
+}
+
+// IP'nin iyi bir geçmişi olup olmadığını kontrol et
+func (ct *ConnectionTracker) hasGoodHistory(ip string) bool {
+	if score, exists := ct.trustedHosts[ip]; exists {
+		// Başarılı bağlantı oranı yüksekse
+		successRate := float64(score.SuccessCount) / float64(score.SuccessCount+score.FailCount)
+		return successRate > 0.9 && score.Score > 0.7
+	}
+	return false
+}
+
+// IP'nin güvenilir bir subnet'te olup olmadığını kontrol et
+func (ct *ConnectionTracker) isInTrustedSubnet(ip string) bool {
+	for _, subnet := range ct.config.TrustedSubnets {
+		_, ipNet, err := net.ParseCIDR(subnet)
+		if err != nil {
+			continue
+		}
+
+		ipAddr := net.ParseIP(ip)
+		if ipAddr != nil && ipNet.Contains(ipAddr) {
+			return true
+		}
+	}
+	return false
+}
+
+// Öğrenme modunu başlat
+func (ct *ConnectionTracker) startLearningMode() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ct.mutex.Lock()
+			// Her IP için trafik pattern'lerini güncelle
+			for ip := range ct.learningData {
+				ct.updateTrafficPatterns(ip)
+			}
+			ct.mutex.Unlock()
+		}
+	}
+}
+
+// Mevcut bağlantı hızını hesapla
+func (ct *ConnectionTracker) calculateCurrentRate(ip string, port int) float64 {
+	now := time.Now()
+	window := now.Add(-10 * time.Minute)
+
+	var count int
+	if accesses, exists := ct.learningData[ip].PortAccesses[port]; exists {
+		for _, access := range accesses {
+			if access.After(window) {
+				count++
+			}
+		}
+	}
+
+	return float64(count) / 600.0 // 10 dakikalık pencerede saniye başına düşen bağlantı
+}
+
+// Port listesinde port var mı kontrol et
+func containsPort(ports []int, port int) bool {
+	for _, p := range ports {
+		if p == port {
+			return true
+		}
+	}
+	return false
+}
+
+// Trafik pattern'lerini güncelle
+func (ct *ConnectionTracker) updateTrafficPatterns(ip string) {
+	data := ct.learningData[ip]
+	patterns := make([]TrafficPattern, 0)
+
+	for port, accesses := range data.PortAccesses {
+		pattern := TrafficPattern{
+			Port:      port,
+			TimeOfDay: make(map[int]float64),
+		}
+
+		// Saat bazında ortalama trafik hesapla
+		hourlyAccesses := make(map[int][]time.Time)
+		for _, access := range accesses {
+			hour := access.Hour()
+			hourlyAccesses[hour] = append(hourlyAccesses[hour], access)
+		}
+
+		for hour, times := range hourlyAccesses {
+			pattern.TimeOfDay[hour] = float64(len(times)) / 24.0 // Saatlik ortalama
+		}
+
+		// Standart sapma hesapla
+		var sum float64
+		for _, rate := range pattern.TimeOfDay {
+			sum += rate
+		}
+		mean := sum / 24.0
+
+		var variance float64
+		for _, rate := range pattern.TimeOfDay {
+			variance += math.Pow(rate-mean, 2)
+		}
+		pattern.StandardDeviation = math.Sqrt(variance / 24.0)
+
+		patterns = append(patterns, pattern)
+	}
+
+	ct.trafficPatterns[ip] = patterns
 }
 
 func main() {
@@ -656,21 +942,29 @@ func main() {
 	}
 
 	config := Config{
-		MaxConnPerIP:   50,
-		TimeWindow:     time.Second * 10,
+		MaxConnPerIP:   100,              // Artırıldı
+		TimeWindow:     time.Second * 30, // Artırıldı
 		BlockDuration:  time.Hour * 24,
 		WhitelistedIPs: []string{"127.0.0.1"},
 		MonitoredPorts: []int{80, 443, 22, 21, 25, 53, 3306, 5432, 8080, 8443},
 		HoneypotPorts:  []int{4444, 8888, 9999},
 		LogFile:        "/var/log/scanblocker.log",
-		MLThreshold:    0.75,
-		DPIPatterns: []DPIPattern{
-			{Name: "SQLi", Pattern: "UNION SELECT", Score: 5.0},
-			{Name: "XSS", Pattern: "<script>", Score: 4.0},
-			{Name: "ShellShock", Pattern: "() {", Score: 5.0},
-			{Name: "Goby", Pattern: "Goby Scanner", Score: 10.0},
+		MLThreshold:    0.85, // Daha toleranslı
+		LearningMode:   true, // Öğrenme modu aktif
+		RateLimits: RateLimitConfig{
+			HTTPRate:    1000, // Saniyede 1000 HTTP isteği
+			SSHRate:     10,   // Saniyede 10 SSH bağlantısı
+			DBRate:      100,  // Saniyede 100 DB bağlantısı
+			DefaultRate: 50,   // Diğer portlar için
+			BurstFactor: 2.0,  // 2x burst toleransı
+			WindowSize:  time.Second * 10,
 		},
-		AlertWebhook: "http://your-webhook-url/alert",
+		TrustedSubnets: []string{
+			"10.0.0.0/8",
+			"172.16.0.0/12",
+			"192.168.0.0/16",
+		},
+		ServicePorts: []int{80, 443, 22, 3306, 5432}, // Legitimate servis portları
 	}
 
 	// Log dosyasını ayarla
@@ -680,21 +974,27 @@ func main() {
 	}
 
 	tracker := NewConnectionTracker()
+	tracker.config = config
 
 	// Honeypot'ları başlat
 	tracker.startHoneypots()
 
-	// Tespit mekanizmalarını başlat
+	// Öğrenme modunu başlat
+	if config.LearningMode {
+		go tracker.startLearningMode()
+	}
+
+	// Servisleri başlat
 	go tracker.detectThreats(config)
 	go detectPortScan(tracker, config)
 	go detectAdvancedScan(tracker, config)
 	go capturePackets(tracker, config)
 
-	fmt.Println("ScanBlocker Pro Aktif")
-	fmt.Println("✓ Port Tarama Koruması")
+	fmt.Println("ScanBlocker Enterprise Edition Aktif")
+	fmt.Println("✓ Akıllı Port Tarama Koruması")
 	fmt.Println("✓ Deep Packet Inspection")
-	fmt.Println("✓ Makine Öğrenmesi Tabanlı Anomali Tespiti")
-	fmt.Println("✓ Honeypot Sistemi")
-	fmt.Println("✓ Detaylı Loglama ve Alert Sistemi")
+	fmt.Println("✓ Self-Learning Anomali Tespiti")
+	fmt.Println("✓ Rate Limiting")
+	fmt.Println("✓ Legitimate Trafik Analizi")
 	select {}
 }
